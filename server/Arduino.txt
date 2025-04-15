@@ -1,0 +1,135 @@
+#include <EEPROM.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <DHT.h>
+
+#define DHTPIN D4  // DHT11 data pin on NodeMCU
+#define DHTTYPE DHT11
+#define SOIL_MOISTURE_PIN A0  // Soil Moisture Sensor Pin
+#define RELAY_PIN D1  // Relay control pin
+
+DHT dht(DHTPIN, DHTTYPE);
+WiFiClient client;
+HTTPClient http;
+
+const char* ssid = "Seths";
+const char* password = "7083510514";
+const char* serverUrl = "http://192.168.0.108:5000/sensor-data";
+
+int alertCount = 0;  // Track user alerts
+bool motorRunning = false;
+
+void connectToWiFi() {
+  Serial.print("Connecting to WiFi...");
+  WiFi.begin(ssid, password);
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(1000);
+    Serial.print(".");
+    attempts++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ Connected to WiFi: Seths");
+  } else {
+    Serial.println("\n⚠️ Failed to connect. Retrying...");
+    delay(5000);
+    connectToWiFi();  // Retry connection
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  dht.begin();
+  pinMode(SOIL_MOISTURE_PIN, INPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
+  connectToWiFi();
+}
+
+void sendSensorData(float temperature, float humidity, int soilMoisture, String message = "") {
+    if (WiFi.status() == WL_CONNECTED) {
+        http.begin(client, serverUrl);
+        http.addHeader("Content-Type", "application/json");
+
+        int user_id = 1;
+        int correctedSoilMoisture = constrain(soilMoisture, 0, 100);
+
+        Serial.printf("📤 Sending: Temp=%.2f, Humidity=%.2f, Moisture=%d\n", temperature, humidity, correctedSoilMoisture);
+
+        String postData = "{";
+        postData += "\"user_id\":" + String(user_id) + ",";
+        postData += "\"temperature\":" + String(temperature, 2) + ",";
+        postData += "\"humidity\":" + String(humidity, 2) + ",";
+        postData += "\"moisture\":" + String(correctedSoilMoisture) + ",";
+        postData += "\"message\":\"" + message + "\"";
+        postData += "}";
+
+        Serial.println("📤 Sending JSON: " + postData);
+
+        int httpResponseCode = http.POST(postData);
+        Serial.print("✅ HTTP Response: "); Serial.println(httpResponseCode);
+
+        if (httpResponseCode > 0) {
+            String response = http.getString();
+            Serial.println("✅ Server Response: " + response);
+        } else {
+            Serial.println("❌ Failed to send data!");
+        }
+        http.end();
+    } else {
+        Serial.println("❌ No WiFi Connection!");
+    }
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("⚠️ Lost WiFi Connection! Reconnecting...");
+    connectToWiFi();
+    return;
+  }
+
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
+  int rawSoilMoisture = analogRead(SOIL_MOISTURE_PIN);
+  int soilMoisture = map(rawSoilMoisture, 1023, 0, 0, 100);
+
+  if (isnan(temperature) || isnan(humidity) || soilMoisture < 0 || soilMoisture > 100) {
+    Serial.println("⚠️ Invalid Sensor Readings! Skipping cycle.");
+    delay(5000);
+    return;
+  }
+
+  Serial.printf("🌡️ Temp: %.2f°C | 💧 Humidity: %.2f%% | 🌱 Soil Moisture: %d%%\n", temperature, humidity, soilMoisture);
+
+  // **Motor Control Logic**
+  
+  // ✅ Start Motor when Soil Moisture < 30% and send alerts
+  if (soilMoisture < 30 && !motorRunning) {
+    if (alertCount < 5) {
+      Serial.println("⚠️ Soil Moisture Low! Sending Alert...");
+      sendSensorData(temperature, humidity, soilMoisture, "Soil Moisture Low! Start Motor Manually");
+      alertCount++;
+    } else {
+      Serial.println("⚠️ User ignored alerts! Auto Starting Motor...");
+      digitalWrite(RELAY_PIN, HIGH);
+      motorRunning = true;
+      sendSensorData(temperature, humidity, soilMoisture, "User ignored alerts! Auto Started Motor");
+    }
+  }
+
+  // ✅ Stop Motor when Soil Moisture >= 40%
+  else if (motorRunning && soilMoisture >= 40) {
+    Serial.println("🛑 Soil Moisture reached 40%! Stopping Motor...");
+    digitalWrite(RELAY_PIN, LOW);
+    motorRunning = false;
+    alertCount = 0;  // Reset alert count after motor stops
+    sendSensorData(temperature, humidity, soilMoisture, "Motor Stopped at 40% Soil Moisture");
+  }
+
+  // ✅ Send Normal Data if temperature is in range
+  else if (temperature >= 21 && temperature <= 29) {
+    sendSensorData(temperature, humidity, soilMoisture, "Temperature Normal");
+  }
+
+  delay(5000);
+}
